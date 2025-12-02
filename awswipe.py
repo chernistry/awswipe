@@ -8,38 +8,49 @@ from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 import boto3
-from botocore.exceptions import ClientError, WaiterError
+from botocore.exceptions import ClientError, WaiterError, EndpointConnectionError
 
-SLEEP_SHORT = 2
-SLEEP_MEDIUM = 5
-SLEEP_LONG = 10
-SLEEP_EXTRA_LONG = 30
+SLEEP_SHORT, SLEEP_MEDIUM, SLEEP_LONG, SLEEP_EXTRA_LONG = 2, 5, 10, 30
 
-# Initial basicConfig (will be overridden by -v options later)
-logging.basicConfig(level=logging.WARNING,
-                    format='%(asctime)s [%(levelname)s] %(message)s',
-                    datefmt='%Y-%m-%d %H:%M:%S')
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-def retry_delete(operation, description, max_attempts=5, base_delay=SLEEP_MEDIUM):
+def retry_delete(operation, description, max_attempts=8):
+    base_delay = 1.2
+    for attempt in range(max_attempts):
+        try:
+            return operation()
+        except ClientError as e:
+            code = e.response.get('Error', {}).get('Code', '')
+            if code in ['Throttling', 'RequestLimitExceeded']:
+                jitter = random.uniform(0.5, 1.5)
+                delay = min(base_delay * (2 ** attempt) * jitter, 60)
+                time.sleep(delay)
+            else:
+                raise
+    raise Exception(f"Max retries ({max_attempts}) exceeded for {description}")
+
+def retry_delete_with_backoff(operation, description, max_attempts=8, base_delay=SLEEP_SHORT):
     attempts = 0
     while attempts < max_attempts:
         try:
             operation()
-            logging.info('%s succeeded', description)
+            logging.info(f'{description} succeeded')
             return True
         except ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', '')
-            if error_code in ['DependencyViolation', 'InvalidIPAddress.InUse',
-                              'Throttling', 'ThrottlingException', 'RequestLimitExceeded']:
-                attempts += 1
+            code = e.response.get('Error', {}).get('Code', '')
+            if code in ['Throttling', 'RequestLimitExceeded']:
                 delay = base_delay * (2 ** (attempts - 1)) + random.uniform(0, 1)
-                logging.warning('%s failed with %s; attempt %d/%d. Retrying in %.2f seconds...',
-                                description, error_code, attempts, max_attempts, delay)
+                logging.warning(f'{description} failed with {code}; retrying in {delay:.2f} seconds...')
                 time.sleep(delay)
             else:
-                logging.error('%s failed: %s', description, e)
+                logging.error(f'{description} failed: {e}')
                 return False
-    logging.error('%s failed after %s attempts.', description, max_attempts)
+        attempts += 1
+    logging.error(f'{description} failed after {max_attempts} attempts')
     return False
 
 def timed(func):
@@ -93,8 +104,7 @@ class SuperAWSResourceCleaner:
     def get_all_regions(self):
         ec2 = self.session.client('ec2')
         try:
-            regions_info = ec2.describe_regions()['Regions']
-            regions = [region['RegionName'] for region in regions_info]
+            regions = [r['RegionName'] for r in ec2.describe_regions()['Regions']]
             logging.info('Retrieved regions: %s', regions)
             return regions
         except ClientError as e:
@@ -110,38 +120,29 @@ class SuperAWSResourceCleaner:
                 b_name = bucket['Name']
                 logging.info('Processing S3 bucket: %s', b_name)
                 self._empty_s3_bucket(s3, b_name)
-                success = retry_delete(lambda: s3.delete_bucket(Bucket=b_name),
-                                       f"Delete S3 Bucket {b_name}")
-                self._record_result('S3 Buckets', b_name, success,
-                                    '' if success else 'Cannot delete bucket; may require MFA')
+                success = retry_delete(lambda: s3.delete_bucket(Bucket=b_name), f"Delete S3 Bucket {b_name}")
+                self._record_result('S3 Buckets', b_name, success, '' if success else 'Cannot delete bucket; may require MFA')
         except ClientError as e:
             logging.error('Error listing S3 buckets: %s', e)
 
     def _empty_s3_bucket(self, s3, bucket_name):
         logging.info('Emptying bucket: %s', bucket_name)
         try:
-            mp_resp = s3.list_multipart_uploads(Bucket=bucket_name)
-            uploads = mp_resp.get('Uploads', [])
+            uploads = s3.list_multipart_uploads(Bucket=bucket_name).get('Uploads', [])
             for upload in uploads:
-                key = upload['Key']
-                upload_id = upload['UploadId']
-                retry_delete(lambda: s3.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id),
-                             f"Abort MPU for {key}")
+                key, upload_id = upload['Key'], upload['UploadId']
+                retry_delete(lambda: s3.abort_multipart_upload(Bucket=bucket_name, Key=key, UploadId=upload_id), f"Abort MPU for {key}")
         except ClientError:
             pass
         paginator = s3.get_paginator('list_object_versions')
         try:
             for page in paginator.paginate(Bucket=bucket_name):
-                objs = []
-                for v in page.get('Versions', []):
-                    objs.append({'Key': v['Key'], 'VersionId': v['VersionId']})
-                for d in page.get('DeleteMarkers', []):
-                    objs.append({'Key': d['Key'], 'VersionId': d['VersionId']})
+                objs = [{'Key': v['Key'], 'VersionId': v['VersionId']} for v in page.get('Versions', [])]
+                objs += [{'Key': d['Key'], 'VersionId': d['VersionId']} for d in page.get('DeleteMarkers', [])]
                 while objs:
                     batch = objs[:1000]
                     del_objs = {'Objects': batch, 'Quiet': True}
-                    success = retry_delete(lambda: s3.delete_objects(Bucket=bucket_name, Delete=del_objs),
-                                           f"Deleting objects in {bucket_name}")
+                    success = retry_delete(lambda: s3.delete_objects(Bucket=bucket_name, Delete=del_objs), f"Deleting objects in {bucket_name}")
                     objs = objs[1000:]
                     if not success:
                         break
@@ -150,676 +151,50 @@ class SuperAWSResourceCleaner:
 
     @timed
     def cleanup_region(self, region):
-        logging.info(f"=== Cleaning region {region} ===")
-        try:
-            ecs_client = self.session.client('ecs', region_name=region)
-            ecr_client = self.session.client('ecr', region_name=region)
-            efs_client = self.session.client('efs', region_name=region)
-            apig_client = self.session.client('apigateway', region_name=region)
-            apigv2_client = self.session.client('apigatewayv2', region_name=region)
-            sqs_client = self.session.client('sqs', region_name=region)
-            sns_client = self.session.client('sns', region_name=region)
-            sfn_client = self.session.client('stepfunctions', region_name=region)
-            asg_client = self.session.client('autoscaling', region_name=region)
-            ec2_client = self.session.client('ec2', region_name=region)
-            elbv2_client = self.session.client('elbv2', region_name=region)
-            elbv1_client = self.session.client('elb', region_name=region)
-            rds_client = self.session.client('rds', region_name=region)
-            lambda_client = self.session.client('lambda', region_name=region)
-            cf_client = self.session.client('cloudformation', region_name=region)
-            sm_client = self.session.client('secretsmanager', region_name=region)
-            ssm_client = self.session.client('ssm', region_name=region)
-            logs_client = self.session.client('logs', region_name=region)
-            elasticache_client = self.session.client('elasticache', region_name=region)
-            redshift_client = self.session.client('redshift', region_name=region)
+        visited = set()
+        def dfs(resource):
+            for dependency in self.resolve_dependencies(resource):
+                if dependency not in visited:
+                    dfs(dependency)
+            if hasattr(self, f'delete_{resource}'):
+                getattr(self, f'delete_{resource}')(region)
+            visited.add(resource)
+        
+        cleanup_order = [
+            'kms_keys',  # Processed LAST in regional cleanup due to reversed iteration
+            # Add other fundamental/shared resources that should be deleted very late (appearing early in this list)
+            # e.g., 'vpc' would typically be here or handled with very specific dependency logic
 
-            self.delete_ecs_clusters_services(ecs_client, region)
-            self.delete_ecr_repos(ecr_client, region)
-            self.delete_efs(efs_client, region)
-            self.delete_api_gateways(apig_client, apigv2_client, region)
-            self.delete_sqs_queues(sqs_client, region)
-            self.delete_sns_topics(sns_client, region)
-            self.delete_stepfunctions(sfn_client, region)
-            self.delete_auto_scaling_groups(asg_client, region)
-            self.detach_instance_security_groups(ec2_client, region)
-            self.detach_instance_network_interfaces(ec2_client, region)
-            self.delete_elastic_ips(ec2_client, region)
-            self.terminate_ec2_instances(ec2_client, region)
-            time.sleep(SLEEP_MEDIUM)
-            self.delete_load_balancers(elbv2_client, region)
-            self.delete_classic_load_balancers(elbv1_client, region)
-            self.delete_all_vpcs(ec2_client, region)
-            self.delete_all_security_groups(ec2_client, region)
-            self.delete_rds_instances(rds_client, region)
-            self.delete_dhcp_options(ec2_client, region)
-            self.delete_managed_prefix_lists(ec2_client, region)
-            self.delete_network_acls(ec2_client, region)
-            self.delete_lambda_functions(lambda_client, region)
-            self.delete_cloudformation_stacks(cf_client, region)
-            self.delete_secrets(sm_client, region)
-            self.delete_ssm_parameters(ssm_client, region)
-            self.delete_log_groups(logs_client, region)
-            self.delete_elasticache_clusters(elasticache_client, region)
-            self.delete_redshift_clusters(redshift_client, region)
-            self.delete_ebs_volumes_and_snapshots(ec2_client, region)
-        except Exception as e:
-            logging.error(f"Fatal error in region {region}: {e}")
-
-    def delete_ecs_clusters_services(self, ecs, region):
-        try:
-            clusters_resp = ecs.list_clusters()
-            cluster_arns = clusters_resp.get('clusterArns', [])
-            for cluster_arn in cluster_arns:
-                services_resp = ecs.list_services(cluster=cluster_arn)
-                service_arns = services_resp.get('serviceArns', [])
-                for svc_arn in service_arns:
-                    logging.info(f"[{region}] Deleting ECS service {svc_arn}")
-                    success = retry_delete(lambda: ecs.delete_service(cluster=cluster_arn, service=svc_arn, force=True),
-                                           f"Delete ECS service {svc_arn}")
-                    self._record_result('ECS Services', svc_arn, success)
-                logging.info(f"[{region}] Deleting ECS cluster {cluster_arn}")
-                success = retry_delete(lambda: ecs.delete_cluster(cluster=cluster_arn),
-                                       f"Delete ECS cluster {cluster_arn}")
-                self._record_result('ECS Clusters', cluster_arn, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing/deleting ECS clusters/services: {e}")
-
-    def delete_ecr_repos(self, ecr, region):
-        try:
-            repos_resp = ecr.describe_repositories()
-            repos = repos_resp.get('repositories', [])
-            for repo in repos:
-                repo_name = repo['repositoryName']
-                logging.info(f"[{region}] Deleting ECR repo {repo_name}")
-                success = retry_delete(lambda: ecr.delete_repository(repositoryName=repo_name, force=True),
-                                       f"Delete ECR repository {repo_name}")
-                self._record_result('ECR Repos', repo_name, success)
-        except ClientError as e:
-            if 'RepositoryNotFoundException' in str(e):
-                logging.info(f"[{region}] No ECR repositories found.")
-            else:
-                logging.error(f"[{region}] Error describing ECR repositories: {e}")
-
-    def delete_efs(self, efs, region):
-        try:
-            resp = efs.describe_file_systems()
-            file_systems = resp.get('FileSystems', [])
-            for fs in file_systems:
-                fs_id = fs['FileSystemId']
-                mt_resp = efs.describe_mount_targets(FileSystemId=fs_id)
-                for mt in mt_resp.get('MountTargets', []):
-                    mt_id = mt['MountTargetId']
-                    logging.info(f"[{region}] Deleting EFS mount target {mt_id}")
-                    success = retry_delete(lambda: efs.delete_mount_target(MountTargetId=mt_id),
-                                           f"Delete EFS mount target {mt_id}")
-                    self._record_result('EFS Mount Targets', mt_id, success)
-                logging.info(f"[{region}] Deleting EFS file system {fs_id}")
-                success = retry_delete(lambda: efs.delete_file_system(FileSystemId=fs_id),
-                                       f"Delete EFS file system {fs_id}")
-                self._record_result('EFS File Systems', fs_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing/deleting EFS: {e}")
-
-    def delete_api_gateways(self, apig, apigv2, region):
-        try:
-            apis = apig.get_rest_apis().get('items', [])
-            for api in apis:
-                api_id = api['id']
-                logging.info(f"[{region}] Deleting API Gateway (REST) {api_id}")
-                success = retry_delete(lambda: apig.delete_rest_api(restApiId=api_id),
-                                       f"Delete API Gateway (REST) {api_id}")
-                self._record_result('API Gateway (REST)', api_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing/deleting REST APIs: {e}")
-        try:
-            v2_apis = apigv2.get_apis().get('Items', [])
-            for v2api in v2_apis:
-                api_id = v2api['ApiId']
-                logging.info(f"[{region}] Deleting API Gateway (HTTP/WebSocket) {api_id}")
-                success = retry_delete(lambda: apigv2.delete_api(ApiId=api_id),
-                                       f"Delete API Gateway (HTTP/WebSocket) {api_id}")
-                self._record_result('API Gateway (HTTPv2)', api_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing/deleting HTTP/WebSocket APIs: {e}")
-
-    def delete_sqs_queues(self, sqs, region):
-        try:
-            resp = sqs.list_queues()
-            queue_urls = resp.get('QueueUrls', [])
-            for q_url in queue_urls:
-                logging.info(f"[{region}] Deleting SQS queue {q_url}")
-                success = retry_delete(lambda: sqs.delete_queue(QueueUrl=q_url),
-                                       f"Delete SQS queue {q_url}")
-                self._record_result('SQS Queues', q_url, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing/deleting SQS queues: {e}")
-
-    def delete_sns_topics(self, sns, region):
-        try:
-            resp = sns.list_topics()
-            topics = resp.get('Topics', [])
-            for t in topics:
-                topic_arn = t['TopicArn']
-                subs_resp = sns.list_subscriptions_by_topic(TopicArn=topic_arn)
-                subs = subs_resp.get('Subscriptions', [])
-                for s in subs:
-                    sub_arn = s['SubscriptionArn']
-                    if sub_arn != 'PendingConfirmation':
-                        logging.info(f"[{region}] Unsubscribing {sub_arn}")
-                        success = retry_delete(lambda: sns.unsubscribe(SubscriptionArn=sub_arn),
-                                               f"Unsubscribe {sub_arn}")
-                        self._record_result('SNS Subscriptions', sub_arn, success)
-                logging.info(f"[{region}] Deleting SNS topic {topic_arn}")
-                success = retry_delete(lambda: sns.delete_topic(TopicArn=topic_arn),
-                                       f"Delete SNS topic {topic_arn}")
-                self._record_result('SNS Topics', topic_arn, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing/deleting SNS topics: {e}")
-
-    def delete_stepfunctions(self, sfn, region):
-        try:
-            resp = sfn.list_state_machines()
-            sms = resp.get('stateMachines', [])
-            for sm in sms:
-                sm_arn = sm['stateMachineArn']
-                logging.info(f"[{region}] Deleting StepFunction machine {sm_arn}")
-                success = retry_delete(lambda: sfn.delete_state_machine(stateMachineArn=sm_arn),
-                                       f"Delete StepFunction {sm_arn}")
-                self._record_result('Step Functions', sm_arn, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing/deleting StepFunctions: {e}")
-
-    def delete_auto_scaling_groups(self, asg, region):
-        try:
-            groups = asg.describe_auto_scaling_groups().get('AutoScalingGroups', [])
-            for g in groups:
-                asg_name = g['AutoScalingGroupName']
-                logging.info(f"[{region}] Deleting ASG {asg_name}")
-                success = retry_delete(lambda: asg.delete_auto_scaling_group(AutoScalingGroupName=asg_name,
-                                                                             ForceDelete=True),
-                                       f"Delete AutoScaling Group {asg_name}")
-                self._record_result('Auto Scaling Groups', asg_name, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing ASGs: {e}")
-
-    def detach_instance_security_groups(self, ec2, region):
-        try:
-            resp = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running', 'stopped']}])
-            for r in resp.get('Reservations', []):
-                for inst in r.get('Instances', []):
-                    inst_id = inst['InstanceId']
-                    vpc_id = inst.get('VpcId')
-                    if not vpc_id:
-                        continue
-                    sg_resp = ec2.describe_security_groups(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]},
-                                                                    {'Name': 'group-name', 'Values': ['default']}])
-                    default_sgs = sg_resp.get('SecurityGroups', [])
-                    if not default_sgs:
-                        continue
-                    default_sg = default_sgs[0]['GroupId']
-                    logging.info(f"[{region}] Forcing {inst_id} SG to default {default_sg}")
-                    try:
-                        ec2.modify_instance_attribute(InstanceId=inst_id, Groups=[default_sg])
-                    except ClientError as e:
-                        logging.error(f"Error forcing default SG on {inst_id}: {e}")
-                    time.sleep(SLEEP_SHORT)
-        except ClientError as e:
-            logging.error(f"[{region}] Error detaching instance security groups: {e}")
-
-    def detach_instance_network_interfaces(self, ec2, region):
-        try:
-            resp = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running', 'stopped']}])
-            for r in resp.get('Reservations', []):
-                for inst in r.get('Instances', []):
-                    inst_id = inst['InstanceId']
-                    for ni in inst.get('NetworkInterfaces', []):
-                        if ni.get('Status', '').lower() == 'attaching':
-                            continue
-                        attachment = ni.get('Attachment', {})
-                        if attachment and attachment.get('DeviceIndex', 0) != 0:
-                            attach_id = attachment['AttachmentId']
-                            ni_id = ni['NetworkInterfaceId']
-                            logging.info(f"[{region}] Detaching NIC {ni_id} from {inst_id}")
-                            try:
-                                ec2.detach_network_interface(AttachmentId=attach_id, Force=True)
-                            except ClientError as e:
-                                logging.error(f"Error detaching NIC {ni_id}: {e}")
-                            time.sleep(SLEEP_SHORT)
-        except ClientError as e:
-            logging.error(f"[{region}] Error detaching NICs: {e}")
-
-    def delete_elastic_ips(self, ec2, region):
-        try:
-            addresses = ec2.describe_addresses().get('Addresses', [])
-            for addr in addresses:
-                alloc_id = addr.get('AllocationId')
-                public_ip = addr.get('PublicIp')
-                if not alloc_id:
-                    continue
-                logging.info(f"[{region}] Releasing EIP {public_ip}")
-                success = retry_delete(lambda: ec2.release_address(AllocationId=alloc_id),
-                                       f"Release EIP {public_ip}")
-                self._record_result('Elastic IPs', public_ip, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing EIPs: {e}")
-
-    def terminate_ec2_instances(self, ec2, region):
-        try:
-            resp = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running', 'stopped']}])
-            inst_ids = []
-            for r in resp.get('Reservations', []):
-                for inst in r.get('Instances', []):
-                    inst_ids.append(inst['InstanceId'])
-            if not inst_ids:
-                logging.info(f"[{region}] No EC2 instances to terminate.")
-                return
-            logging.info(f"[{region}] Terminating instances {inst_ids}")
-            ec2.terminate_instances(InstanceIds=inst_ids)
-            for i_id in inst_ids:
-                self._record_result('EC2 Instances', i_id, True)
-            waiter = ec2.get_waiter('instance_terminated')
-            try:
-                waiter.wait(InstanceIds=inst_ids, WaiterConfig={'Delay': 5, 'MaxAttempts': 60})
-                logging.info(f"[{region}] Instances are fully terminated: {inst_ids}")
-            except WaiterError as e:
-                logging.warning(f"[{region}] Waiter for termination timed out: {e}")
-        except ClientError as e:
-            logging.error(f"[{region}] Error terminating EC2 instances: {e}")
-
-    def delete_load_balancers(self, elbv2, region):
-        try:
-            lbs = elbv2.describe_load_balancers().get('LoadBalancers', [])
-            for lb in lbs:
-                lb_arn = lb['LoadBalancerArn']
-                lb_name = lb['LoadBalancerName']
-                logging.info(f"[{region}] Deleting ALB/NLB {lb_name}")
-                success = retry_delete(lambda: elbv2.delete_load_balancer(LoadBalancerArn=lb_arn),
-                                       f"Delete LB {lb_name}")
-                self._record_result('Load Balancers (ALB/NLB)', lb_name, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing ELBv2: {e}")
-
-    def delete_classic_load_balancers(self, elbv1, region):
-        try:
-            lbs = elbv1.describe_load_balancers().get('LoadBalancerDescriptions', [])
-            for lb in lbs:
-                lb_name = lb['LoadBalancerName']
-                logging.info(f"[{region}] Deleting Classic ELB {lb_name}")
-                success = retry_delete(lambda: elbv1.delete_load_balancer(LoadBalancerName=lb_name),
-                                       f"Delete classic ELB {lb_name}")
-                self._record_result('Classic Load Balancers', lb_name, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing classic ELBs: {e}")
-
-    def delete_all_vpcs(self, ec2, region):
-        try:
-            vpcs = ec2.describe_vpcs().get('Vpcs', [])
-            for v in vpcs:
-                vpc_id = v['VpcId']
-                logging.info(f"[{region}] Deleting sub-resources for VPC {vpc_id}")
-                self.delete_vpc_endpoints(ec2, vpc_id, region)
-                self.delete_vpn_gateways(ec2, vpc_id, region)
-                self.delete_vpc_peering_connections(ec2, vpc_id, region)
-                self.delete_network_interfaces(ec2, vpc_id, region)
-                self.delete_nat_gateways(ec2, vpc_id, region)
-                self.delete_internet_gateways(ec2, vpc_id, region)
-                self.delete_route_tables(ec2, vpc_id, region)
-                self.delete_vpc_security_groups(ec2, vpc_id, region)
-                self.delete_subnets(ec2, vpc_id, region)
-                logging.info(f"[{region}] Deleting VPC {vpc_id}")
-                success = retry_delete(lambda: ec2.delete_vpc(VpcId=vpc_id),
-                                       f"Delete VPC {vpc_id}")
-                self._record_result('VPCs', vpc_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing VPCs: {e}")
-
-    def delete_vpc_endpoints(self, ec2, vpc_id, region):
-        try:
-            eps = ec2.describe_vpc_endpoints(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]).get('VpcEndpoints', [])
-            for ep in eps:
-                ep_id = ep['VpcEndpointId']
-                logging.info(f"[{region}] Deleting VPC endpoint {ep_id}")
-                success = retry_delete(lambda: ec2.delete_vpc_endpoints(VpcEndpointIds=[ep_id]),
-                                       f"Delete VPC endpoint {ep_id}")
-                self._record_result('VPC Endpoints', ep_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing VPC endpoints: {e}")
-
-    def delete_vpn_gateways(self, ec2, vpc_id, region):
-        try:
-            vgws = ec2.describe_vpn_gateways(Filters=[{'Name': 'attachment.vpc-id', 'Values': [vpc_id]}]).get('VpnGateways', [])
-            for vgw in vgws:
-                vgw_id = vgw['VpnGatewayId']
-                logging.info(f"[{region}] Detaching & deleting VPN GW {vgw_id}")
-                for att in vgw.get('VpcAttachments', []):
-                    retry_delete(lambda: ec2.detach_vpn_gateway(VpnGatewayId=vgw_id, VpcId=vpc_id),
-                                 f"Detach VPN GW {vgw_id}")
-                success = retry_delete(lambda: ec2.delete_vpn_gateway(VpnGatewayId=vgw_id),
-                                       f"Delete VPN GW {vgw_id}")
-                self._record_result('VPN Gateways', vgw_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing VPN GWs: {e}")
-
-    def delete_vpc_peering_connections(self, ec2, vpc_id, region):
-        try:
-            req = ec2.describe_vpc_peering_connections(Filters=[{'Name': 'requester-vpc-info.vpc-id', 'Values': [vpc_id]}]).get('VpcPeeringConnections', [])
-            acc = ec2.describe_vpc_peering_connections(Filters=[{'Name': 'accepter-vpc-info.vpc-id', 'Values': [vpc_id]}]).get('VpcPeeringConnections', [])
-            for peering in req + acc:
-                pcx_id = peering['VpcPeeringConnectionId']
-                logging.info(f"[{region}] Deleting VPC peering {pcx_id}")
-                success = retry_delete(lambda: ec2.delete_vpc_peering_connection(VpcPeeringConnectionId=pcx_id),
-                                       f"Delete VPC peering {pcx_id}")
-                self._record_result('VPC Peering Connections', pcx_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing VPC peering: {e}")
-
-    def delete_network_interfaces(self, ec2, vpc_id, region):
-        try:
-            nis = ec2.describe_network_interfaces(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]).get('NetworkInterfaces', [])
-            for ni in nis:
-                ni_id = ni['NetworkInterfaceId']
-                logging.info(f"[{region}] Deleting network interface {ni_id}")
-                success = retry_delete(lambda: ec2.delete_network_interface(NetworkInterfaceId=ni_id),
-                                       f"Delete NIC {ni_id}")
-                self._record_result('Network Interfaces', ni_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing network interfaces: {e}")
-
-    def delete_nat_gateways(self, ec2, vpc_id, region):
-        try:
-            ngws = ec2.describe_nat_gateways(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]).get('NatGateways', [])
-            for ngw in ngws:
-                ngw_id = ngw['NatGatewayId']
-                logging.info(f"[{region}] Deleting NAT GW {ngw_id}")
-                success = retry_delete(lambda: ec2.delete_nat_gateway(NatGatewayId=ngw_id),
-                                       f"Delete NAT GW {ngw_id}")
-                self._record_result('NAT Gateways', ngw_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing NAT GWs: {e}")
-
-    def delete_internet_gateways(self, ec2, vpc_id, region):
-        try:
-            igws = ec2.describe_internet_gateways(Filters=[{'Name': 'attachment.vpc-id', 'Values': [vpc_id]}]).get('InternetGateways', [])
-            for igw in igws:
-                igw_id = igw['InternetGatewayId']
-                logging.info(f"[{region}] Detaching & deleting IGW {igw_id}")
-                retry_delete(lambda: ec2.detach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id),
-                             f"Detach IGW {igw_id}")
-                success = retry_delete(lambda: ec2.delete_internet_gateway(InternetGatewayId=igw_id),
-                                       f"Delete IGW {igw_id}")
-                self._record_result('Internet Gateways', igw_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing IGWs: {e}")
-
-    def delete_route_tables(self, ec2, vpc_id, region):
-        try:
-            rts = ec2.describe_route_tables(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]).get('RouteTables', [])
-            for rt in rts:
-                rt_id = rt['RouteTableId']
-                if any(a.get('Main', False) for a in rt.get('Associations', [])):
-                    logging.info(f"[{region}] Skipping main route table {rt_id}")
-                    continue
-                logging.info(f"[{region}] Deleting route table {rt_id}")
-                success = retry_delete(lambda: ec2.delete_route_table(RouteTableId=rt_id),
-                                       f"Delete route table {rt_id}")
-                self._record_result('Route Tables', rt_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing route tables: {e}")
-
-    def delete_vpc_security_groups(self, ec2, vpc_id, region):
-        try:
-            sgs = ec2.describe_security_groups(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]).get('SecurityGroups', [])
-            for sg in sgs:
-                if sg['GroupName'] == 'default':
-                    continue
-                sg_id = sg['GroupId']
-                logging.info(f"[{region}] Deleting SG {sg_id}")
-                success = retry_delete(lambda: ec2.delete_security_group(GroupId=sg_id),
-                                       f"Delete SG {sg_id}")
-                self._record_result('Security Groups', sg_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing SGs in VPC {vpc_id}: {e}")
-
-    def delete_subnets(self, ec2, vpc_id, region):
-        try:
-            subs = ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]).get('Subnets', [])
-            for s in subs:
-                sn_id = s['SubnetId']
-                logging.info(f"[{region}] Deleting subnet {sn_id}")
-                success = retry_delete(lambda: ec2.delete_subnet(SubnetId=sn_id),
-                                       f"Delete subnet {sn_id}")
-                self._record_result('Subnets', sn_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing subnets: {e}")
-
-    def delete_all_security_groups(self, ec2, region):
-        try:
-            sgs = ec2.describe_security_groups().get('SecurityGroups', [])
-            for sg in sgs:
-                if sg['GroupName'] == 'default':
-                    continue
-                sg_id = sg['GroupId']
-                logging.info(f"[{region}] Deleting leftover SG {sg_id}")
-                success = retry_delete(lambda: ec2.delete_security_group(GroupId=sg_id),
-                                       f"Delete leftover SG {sg_id}")
-                self._record_result('Security Groups', sg_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing leftover SGs: {e}")
-
-    def delete_rds_instances(self, rds, region):
-        try:
-            dbs = rds.describe_db_instances().get('DBInstances', [])
-            for db in dbs:
-                db_id = db['DBInstanceIdentifier']
-                logging.info(f"[{region}] Deleting RDS {db_id}")
-                success = True
-                try:
-                    rds.delete_db_instance(DBInstanceIdentifier=db_id, SkipFinalSnapshot=True)
-                except ClientError as e:
-                    success = False
-                    logging.error(f"[{region}] Error deleting RDS {db_id}: {e}")
-                self._record_result('RDS Instances', db_id, success)
-                time.sleep(SLEEP_LONG)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing RDS: {e}")
-
-    def delete_dhcp_options(self, ec2, region):
-        try:
-            resp = ec2.describe_dhcp_options().get('DhcpOptions', [])
-            for dopt in resp:
-                dopt_id = dopt['DhcpOptionsId']
-                if dopt_id == 'default':
-                    continue
-                logging.info(f"[{region}] Deleting DHCP options {dopt_id}")
-                success = retry_delete(lambda: ec2.delete_dhcp_options(DhcpOptionsId=dopt_id),
-                                       f"Delete DHCP options {dopt_id}")
-                self._record_result('DHCP Options', dopt_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing DHCP options: {e}")
-
-    def delete_managed_prefix_lists(self, ec2, region):
-        sts = self.session.client('sts')
-        try:
-            acct_id = sts.get_caller_identity()['Account']
-        except ClientError:
-            acct_id = None
-        try:
-            pls = ec2.describe_managed_prefix_lists().get('PrefixLists', [])
-            for pl in pls:
-                pl_id = pl['PrefixListId']
-                owner_id = pl['OwnerId']
-                if acct_id and owner_id != acct_id:
-                    logging.info(f"[{region}] Skipping AWS-managed prefix list {pl_id}")
-                    continue
-                logging.info(f"[{region}] Deleting prefix list {pl_id}")
-                success = retry_delete(lambda: ec2.delete_managed_prefix_list(PrefixListId=pl_id),
-                                       f"Delete prefix list {pl_id}")
-                self._record_result('Managed Prefix Lists', pl_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing prefix lists: {e}")
-
-    def delete_network_acls(self, ec2, region):
-        try:
-            acls = ec2.describe_network_acls().get('NetworkAcls', [])
-            for acl in acls:
-                if acl.get('IsDefault'):
-                    continue
-                acl_id = acl['NetworkAclId']
-                logging.info(f"[{region}] Deleting network ACL {acl_id}")
-                success = retry_delete(lambda: ec2.delete_network_acl(NetworkAclId=acl_id),
-                                       f"Delete network ACL {acl_id}")
-                self._record_result('Network ACLs', acl_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing NACLs: {e}")
-
-    def delete_lambda_functions(self, lamb, region):
-        try:
-            paginator = lamb.get_paginator('list_functions')
-            for page in paginator.paginate():
-                fns = page.get('Functions', [])
-                for fn in fns:
-                    fn_name = fn['FunctionName']
-                    try:
-                        mappings = lamb.list_event_source_mappings(FunctionName=fn_name).get('EventSourceMappings', [])
-                        for mapping in mappings:
-                            mapping_uuid = mapping['UUID']
-                            logging.info(f"[{region}] Deleting event source mapping {mapping_uuid} for lambda {fn_name}")
-                            success = retry_delete(lambda: lamb.delete_event_source_mapping(UUID=mapping_uuid),
-                                                   f"Delete event source mapping {mapping_uuid}")
-                            self._record_result('Lambda Event Source Mappings', mapping_uuid, success)
-                    except ClientError as e:
-                        logging.error(f"[{region}] Error listing event source mappings for {fn_name}: {e}")
-                    logging.info(f"[{region}] Deleting lambda function {fn_name}")
-                    success = retry_delete(lambda: lamb.delete_function(FunctionName=fn_name),
-                                           f"Delete lambda {fn_name}")
-                    self._record_result('Lambda Functions', fn_name, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing lambda functions: {e}")
-
-    def delete_cloudformation_stacks(self, cf, region):
-        try:
-            stacks_resp = cf.list_stacks(StackStatusFilter=['CREATE_COMPLETE', 'UPDATE_COMPLETE'])
-            stacks = stacks_resp.get('StackSummaries', [])
-            for st in stacks:
-                st_name = st['StackName']
-                logging.info(f"[{region}] Deleting CF stack {st_name}")
-                success = True
-                try:
-                    cf.delete_stack(StackName=st_name)
-                except ClientError as e:
-                    logging.error(f"Error deleting CF stack {st_name}: {e}")
-                    success = False
-                self._record_result('CloudFormation Stacks', st_name, success)
-                time.sleep(SLEEP_LONG)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing CF stacks: {e}")
-
-    def delete_secrets(self, sm, region):
-        try:
-            paginator = sm.get_paginator('list_secrets')
-            for page in paginator.paginate():
-                secrets = page.get('SecretList', [])
-                for s in secrets:
-                    s_name = s['Name']
-                    logging.info(f"[{region}] Deleting secret {s_name}")
-                    success = True
-                    try:
-                        sm.delete_secret(SecretId=s_name, ForceDeleteWithoutRecovery=True)
-                    except ClientError as e:
-                        logging.error(f"Error deleting secret {s_name}: {e}")
-                        success = False
-                    self._record_result('Secrets Manager Secrets', s_name, success)
-                    time.sleep(SLEEP_SHORT)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing secrets: {e}")
-
-    def delete_ssm_parameters(self, ssm, region):
-        try:
-            paginator = ssm.get_paginator('describe_parameters')
-            param_names = []
-            for page in paginator.paginate():
-                for param in page.get('Parameters', []):
-                    param_names.append(param['Name'])
-            while param_names:
-                batch = param_names[:10]
-                del_call = lambda: ssm.delete_parameters(Names=batch)
-                success = retry_delete(del_call, f"Delete SSM parameters {batch}")
-                for name in batch:
-                    self._record_result('SSM Parameters', name, success)
-                param_names = param_names[10:]
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing/deleting SSM params: {e}")
-
-    def delete_log_groups(self, logs, region):
-        try:
-            paginator = logs.get_paginator('describe_log_groups')
-            for page in paginator.paginate():
-                lgs = page.get('logGroups', [])
-                for lg in lgs:
-                    lg_name = lg['logGroupName']
-                    logging.info(f"[{region}] Deleting log group {lg_name}")
-                    success = retry_delete(lambda: logs.delete_log_group(logGroupName=lg_name),
-                                           f"Delete log group {lg_name}")
-                    self._record_result('CloudWatch Log Groups', lg_name, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing log groups: {e}")
-
-    def delete_elasticache_clusters(self, elasticache, region):
-        try:
-            clusters = elasticache.describe_cache_clusters(ShowCacheNodeInfo=True).get('CacheClusters', [])
-            for cluster in clusters:
-                cluster_id = cluster['CacheClusterId']
-                logging.info(f"[{region}] Deleting Elasticache cluster {cluster_id}")
-                success = retry_delete(lambda: elasticache.delete_cache_cluster(CacheClusterId=cluster_id),
-                                       f"Delete Elasticache cluster {cluster_id}")
-                self._record_result('Elasticache Clusters', cluster_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error deleting Elasticache clusters: {e}")
-
-    def delete_redshift_clusters(self, redshift, region):
-        try:
-            clusters = redshift.describe_clusters().get('Clusters', [])
-            for cluster in clusters:
-                cluster_id = cluster['ClusterIdentifier']
-                logging.info(f"[{region}] Deleting Redshift cluster {cluster_id}")
-                success = retry_delete(lambda: redshift.delete_cluster(ClusterIdentifier=cluster_id,
-                                                                       SkipFinalClusterSnapshot=True),
-                                       f"Delete Redshift cluster {cluster_id}")
-                self._record_result('Redshift Clusters', cluster_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error deleting Redshift clusters: {e}")
-
-    def delete_ebs_volumes_and_snapshots(self, ec2, region):
-        try:
-            volumes = ec2.describe_volumes(Filters=[{'Name': 'status', 'Values': ['available']}]).get('Volumes', [])
-            for volume in volumes:
-                vol_id = volume['VolumeId']
-                logging.info(f"[{region}] Deleting EBS volume {vol_id}")
-                success = retry_delete(lambda: ec2.delete_volume(VolumeId=vol_id),
-                                       f"Delete EBS Volume {vol_id}")
-                self._record_result('EBS Volumes', vol_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing/deleting EBS volumes: {e}")
-        try:
-            snapshots = ec2.describe_snapshots(OwnerIds=[self.account_id]).get('Snapshots', [])
-            for snap in snapshots:
-                snap_id = snap['SnapshotId']
-                logging.info(f"[{region}] Deleting EBS snapshot {snap_id}")
-                success = retry_delete(lambda: ec2.delete_snapshot(SnapshotId=snap_id),
-                                       f"Delete EBS Snapshot {snap_id}")
-                self._record_result('EBS Snapshots', snap_id, success)
-        except ClientError as e:
-            logging.error(f"[{region}] Error describing/deleting EBS snapshots: {e}")
+            # Services to be deleted EARLIER in the region (appearing later in this list)
+            'efs',
+            'elasticache',
+            'rds',
+            'dynamodb',
+            'sqs',
+            'sns',
+            'codebuild_projects',
+            # 's3', # S3 buckets are global and handled by delete_s3_buckets_global.
+                     # If specific regional S3 constructs (like Access Points) need cleanup,
+                     # a dedicated delete_s3_regional_resources(self, region) method and entry here would be needed.
+            # 'iam_roles_global', # IAM roles are global and handled by delete_all_iam_roles_global()
+        ]
+        
+        for resource in reversed(cleanup_order):
+            if resource not in visited:
+                dfs(resource)
 
     def delete_eks_clusters_global(self):
         regions = [self.session.region_name] if self.session.region_name else self.get_all_regions()
         for region in regions:
+            if not self.is_service_available(region, 'eks'):
+                logging.info(f"[{region}] EKS not available, skipping")
+                continue
             eks_client = self.session.client('eks', region_name=region)
             try:
                 clusters = eks_client.list_clusters().get('clusters', [])
                 for c in clusters:
                     logging.info(f"[{region}] Deleting EKS cluster {c}")
-                    self.delete_eks_nodegroups(eks_client, region, c)
+                    self.delete_eks_nodegroups(region, c)
                     success = True
                     try:
                         eks_client.delete_cluster(name=c)
@@ -831,50 +206,48 @@ class SuperAWSResourceCleaner:
             except ClientError as e:
                 logging.error(f"[{region}] Error listing EKS clusters: {e}")
 
-    def delete_eks_nodegroups(self, eks_client, region, cluster_name):
+    def delete_eks_nodegroups(self, region, cluster_name=None):
+        eks_client = self.session.client('eks', region_name=region)
         try:
-            ngs = eks_client.list_nodegroups(clusterName=cluster_name).get('nodegroups', [])
-            for ng in ngs:
-                logging.info(f"[{region}] Deleting EKS nodegroup {ng} in cluster {cluster_name}")
+            clusters = [cluster_name] if cluster_name else eks_client.list_clusters().get('clusters', [])
+            for cluster in clusters:
                 try:
-                    eks_client.delete_nodegroup(clusterName=cluster_name, nodegroupName=ng)
+                    ngs = eks_client.list_nodegroups(clusterName=cluster).get('nodegroups', [])
+                    for ng in ngs:
+                        logging.info(f"[{region}] Deleting nodegroup {ng} in cluster {cluster}")
+                        try:
+                            eks_client.delete_nodegroup(clusterName=cluster, nodegroupName=ng)
+                            self.wait_for_nodegroup_deletion(eks_client, region, cluster, ng)
+                        except ClientError as e:
+                            code = e.response.get('Error', {}).get('Code', '')
+                            if code != 'ResourceNotFoundException':
+                                logging.error(f"[{region}] Failed to delete nodegroup {ng}: {e}")
                 except ClientError as e:
-                    logging.error(f"[{region}] Error deleting nodegroup {ng}: {e}")
-                self.wait_for_nodegroup_deletion(eks_client, region, cluster_name, ng)
+                    logging.error(f"[{region}] Error listing nodegroups for cluster {cluster}: {e}")
         except ClientError as e:
-            logging.error(f"[{region}] Error listing nodegroups for {cluster_name}: {e}")
-        try:
-            fps = eks_client.list_fargate_profiles(clusterName=cluster_name).get('fargateProfileNames', [])
-            for fp in fps:
-                logging.info(f"[{region}] Deleting EKS fargate profile {fp} in cluster {cluster_name}")
-                try:
-                    eks_client.delete_fargate_profile(clusterName=cluster_name, fargateProfileName=fp)
-                except ClientError as e:
-                    logging.error(f"[{region}] Error deleting fargate profile {fp}: {e}")
-                time.sleep(SLEEP_MEDIUM)
-        except ClientError as e:
-            logging.error(f"[{region}] Error listing fargate profiles: {e}")
+            logging.error(f"[{region}] EKS nodegroups cleanup failed: {e}")
 
     def wait_for_nodegroup_deletion(self, eks_client, region, cluster, ng):
-        for attempt in range(30):
+        for _ in range(30):
             try:
                 resp = eks_client.describe_nodegroup(clusterName=cluster, nodegroupName=ng)
                 status = resp['nodegroup']['status']
-                if status in ['DELETING', 'CREATE_FAILED', 'ACTIVE', 'UPDATING']:
-                    logging.info(f"[{region}] EKS nodegroup {ng} in cluster {cluster} => {status}. Wait.")
+                if status == 'DELETING':
                     time.sleep(SLEEP_LONG)
                 else:
-                    logging.info(f"[{region}] Nodegroup {ng} => {status}. Assuming done.")
                     return
-            except ClientError:
-                logging.info(f"[{region}] Nodegroup {ng} no longer exists.")
-                return
+            except ClientError as e:
+                if 'NotFoundException' in str(e):
+                    return
+                else:
+                    logging.error(f"[{region}] Error checking nodegroup {ng}: {e}")
+                    return
+        logging.warning(f"[{region}] Timeout waiting for nodegroup {ng} deletion")
 
     def delete_all_iam_roles_global(self):
         iam = self.session.client('iam')
         try:
-            roles_resp = iam.list_roles()
-            roles = roles_resp.get('Roles', [])
+            roles = iam.list_roles().get('Roles', [])
             for role in roles:
                 rname = role['RoleName']
                 if rname.startswith('AWSServiceRoleFor'):
@@ -902,15 +275,13 @@ class SuperAWSResourceCleaner:
             att_pols = iam.list_attached_role_policies(RoleName=role_name).get('AttachedPolicies', [])
             for p in att_pols:
                 p_arn = p['PolicyArn']
-                retry_delete(lambda: iam.detach_role_policy(RoleName=role_name, PolicyArn=p_arn),
-                             f"Detach policy {p_arn} from {role_name}")
+                retry_delete(lambda: iam.detach_role_policy(RoleName=role_name, PolicyArn=p_arn), f"Detach policy {p_arn} from {role_name}")
         except ClientError as e:
             logging.error(f"Error detaching policies from {role_name}: {e}")
         try:
             inlines = iam.list_role_policies(RoleName=role_name).get('PolicyNames', [])
             for pol in inlines:
-                retry_delete(lambda: iam.delete_role_policy(RoleName=role_name, PolicyName=pol),
-                             f"Delete inline policy {pol} from {role_name}")
+                retry_delete(lambda: iam.delete_role_policy(RoleName=role_name, PolicyName=pol), f"Delete inline policy {pol} from {role_name}")
         except ClientError as e:
             logging.error(f"Error removing inline policies from {role_name}: {e}")
 
@@ -920,10 +291,8 @@ class SuperAWSResourceCleaner:
             profiles = page.get('InstanceProfiles', [])
             for p in profiles:
                 p_name = p['InstanceProfileName']
-                retry_delete(lambda: iam.remove_role_from_instance_profile(InstanceProfileName=p_name, RoleName=role_name),
-                             f"Remove {role_name} from {p_name}")
-                success = retry_delete(lambda: iam.delete_instance_profile(InstanceProfileName=p_name),
-                                       f"Delete instance profile {p_name}")
+                retry_delete(lambda: iam.remove_role_from_instance_profile(InstanceProfileName=p_name, RoleName=role_name), f"Remove {role_name} from {p_name}")
+                success = retry_delete(lambda: iam.delete_instance_profile(InstanceProfileName=p_name), f"Delete instance profile {p_name}")
                 self._record_result('Instance IAM Profiles', p_name, success)
 
     def delete_service_linked_roles_global(self):
@@ -1061,7 +430,108 @@ class SuperAWSResourceCleaner:
         except ClientError as e:
             logging.error(f"Error deleting CloudFront distributions: {e}")
 
-    def purge_aws(self, region=None):
+    def delete_bedrock_resources(self, bedrock, region):
+        try:
+            models = bedrock.list_models().get('Models', [])
+            for model in models:
+                model_arn = model['Arn']
+                logging.info(f"[{region}] Deleting Bedrock model {model_arn}")
+                success = retry_delete(lambda: bedrock.delete_model(arn=model_arn), f"Delete Bedrock model {model_arn}")
+                self._record_result('Bedrock Models', model_arn, success)
+        except ClientError as e:
+            logging.error(f"[{region}] Error deleting Bedrock models: {e}")
+
+    def delete_codebuild_projects(self, region):
+        try:
+            codebuild = self.session.client('codebuild', region_name=region)
+            projects = codebuild.list_projects().get('projects', [])
+            for project in projects:
+                logging.info(f"[{region}] Deleting CodeBuild project {project}")
+                success = retry_delete(
+                    lambda: codebuild.delete_project(name=project),
+                    f"Delete CodeBuild project {project}"
+                )
+                self._record_result('CodeBuild Projects', project, success)
+        except ClientError as e:
+            logging.error(f"[{region}] Error deleting CodeBuild projects: {e}")
+
+    def delete_apprunner_services(self, region):
+        try:
+            if not self.is_service_available(region, 'apprunner'):
+                return
+            client = self.session.client('apprunner', region_name=region)
+            services = client.list_services().get('ServiceSummaryList', [])
+            for svc in services:
+                client.delete_service(ServiceArn=svc['ServiceArn'])
+                self._record_result('AppRunner Services', svc['ServiceArn'], True)
+        except client.exceptions.ResourceNotFoundException:
+            pass
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InternalFailure':
+                logging.warning(f"[{region}] AppRunner temporary unavailable")
+            else:
+                raise
+
+    def delete_amplify_apps(self, region):
+        client = self.session.client('amplify', region_name=region)
+        try:
+            apps = client.list_apps()['apps']
+            for app in apps:
+                client.delete_app(appId=app['appId'])
+                self._record_result('Amplify Apps', app['appId'], True)
+        except ClientError as e:
+            logging.error(f"[{region}] Error deleting Amplify apps: {e}")
+
+    # New function to delete KMS keys
+    @timed
+    def delete_kms_keys(self, region):
+        """
+        Delete KMS keys in a region. This will first schedule all customer-managed 
+        keys for deletion with a 7-day waiting period (minimum required by AWS).
+        """
+        try:
+            kms_client = self.session.client('kms', region_name=region)
+            
+            # List all KMS keys in the region
+            paginator = kms_client.get_paginator('list_keys')
+            keys = []
+            
+            for page in paginator.paginate():
+                keys.extend(page['Keys'])
+            
+            for key in keys:
+                key_id = key['KeyId']
+                
+                try:
+                    # Get key details to determine if it's customer-managed (AWS managed keys can't be deleted)
+                    key_info = kms_client.describe_key(KeyId=key_id)
+                    
+                    # Skip AWS managed keys and keys already scheduled for deletion
+                    if key_info['KeyMetadata']['KeyManager'] == 'AWS' or key_info['KeyMetadata'].get('DeletionDate'):
+                        continue
+                    
+                    # Check if key is enabled and not already pending deletion
+                    if key_info['KeyMetadata']['KeyState'] not in ['PendingDeletion', 'PendingReplicaDeletion']:
+                        # Disable the key first
+                        logging.info(f"[{region}] Disabling KMS key {key_id}")
+                        kms_client.disable_key(KeyId=key_id)
+                        
+                        # Schedule key for deletion (minimum 7 days waiting period)
+                        logging.info(f"[{region}] Scheduling KMS key {key_id} for deletion")
+                        success = retry_delete(
+                            lambda: kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7),
+                            f"Schedule KMS key {key_id} deletion"
+                        )
+                        self._record_result('KMS Keys', f"{key_id} ({region})", success)
+                    
+                except ClientError as e:
+                    logging.error(f"[{region}] Error processing KMS key {key_id}: {e}")
+                    self._record_result('KMS Keys', f"{key_id} ({region})", False, str(e))
+                    
+        except ClientError as e:
+            logging.error(f"[{region}] Error accessing KMS: {e}")
+
+    def purge_aws(self, region=None, dry_run=True):
         if region:
             regions = [region]
             logging.info(f"Cleaning only region {region}")
@@ -1070,7 +540,13 @@ class SuperAWSResourceCleaner:
             if not regions:
                 logging.error('No regions found. Exiting.')
                 return
-        with ThreadPoolExecutor(max_workers=min(10, len(regions))) as executor:
+
+        # Add dry-run capability
+        if dry_run:
+            logging.info("Running in dry-run mode - no resources will be deleted")
+            self._record_result = lambda *args, **kwargs: None
+
+        with ThreadPoolExecutor(max_workers=min(20, len(regions))) as executor:
             future_map = {executor.submit(self.cleanup_region, r): r for r in regions}
             for fut in as_completed(future_map):
                 r = future_map[fut]
@@ -1079,25 +555,145 @@ class SuperAWSResourceCleaner:
                     logging.info(f"Completed region {r}")
                 except Exception as ex:
                     logging.error(f"Region {r} encountered fatal error: {ex}")
-        self.delete_eks_clusters_global()
-        self.delete_all_iam_roles_global()
-        self.delete_service_linked_roles_global()
-        self.delete_global_accelerators_global()
-        self.delete_route53_hosted_zones_global()
-        self.delete_cloudfront_distributions_global()
-        self.delete_elastic_beanstalk_environments_global()
-        self.delete_aws_backup_vaults_global()
+                    self._record_result('Region Errors', r, False, str(ex))
+
+        # Add parallel cleanup for global services
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [
+                executor.submit(self.delete_eks_clusters_global),
+                executor.submit(self.delete_all_iam_roles_global),
+                executor.submit(self.delete_service_linked_roles_global),
+                executor.submit(self.delete_global_accelerators_global),
+                executor.submit(self.delete_route53_hosted_zones_global),
+                executor.submit(self.delete_cloudfront_distributions_global),
+                executor.submit(self.delete_elastic_beanstalk_environments_global),
+                executor.submit(self.delete_aws_backup_vaults_global),
+            ]
+
+            if region:
+                # If a specific region is provided, add AppRunner and Amplify tasks for that region.
+                futures.append(executor.submit(self.delete_apprunner_services, region))
+                futures.append(executor.submit(self.delete_amplify_apps, region))
+            else:
+                # If no specific region is provided, 'regions' contains all available regions.
+                # Add AppRunner and Amplify tasks for each of these regions.
+                for r_item in regions: 
+                    futures.append(executor.submit(self.delete_apprunner_services, r_item))
+                    futures.append(executor.submit(self.delete_amplify_apps, r_item))
+            
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as ex:
+                    logging.error(f"Global cleanup error: {ex}")
+
         ssm_global = self.session.client('ssm')
         self.deregister_ssm_managed_instances(ssm_global)
         self.delete_s3_buckets_global()
         logging.info('=== AWS Super Cleanup complete! ===')
         self.print_report()
 
+    def delete_opensearch_domains(self, es, region):
+        domains = es.list_domain_names().get('DomainNames', [])
+        for domain in domains:
+            domain_name = domain['DomainName']
+            logging.info(f"[{region}] Deleting OpenSearch domain {domain_name}")
+            success = retry_delete(lambda: es.delete_elasticsearch_domain(DomainName=domain_name),
+                                  f"Delete OpenSearch domain {domain_name}")
+            self._record_result('OpenSearch Domains', domain_name, success)
+
+    def delete_sagemaker_resources(self, sagemaker, region):
+        models = sagemaker.list_models().get('Models', [])
+        for model in models:
+            model_name = model['ModelName']
+            logging.info(f"[{region}] Deleting SageMaker model {model_name}")
+            success = retry_delete(lambda: sagemaker.delete_model(ModelName=model_name),
+                                  f"Delete SageMaker model {model_name}")
+            self._record_result('SageMaker Models', model_name, success)
+
+    def delete_lambda_layers(self, region):
+        client = self.session.client('lambda', region_name=region)
+        layers = []
+        paginator = client.get_paginator('list_layers')
+        for page in paginator.paginate():
+            layers.extend(page['Layers'])
+        
+        with ThreadPoolExecutor(10) as executor:
+            futures = [executor.submit(
+                client.delete_layer_version,
+                LayerName=layer['LayerName'],
+                VersionNumber=layer['LatestMatchingVersion']['VersionNumber']
+            ) for layer in layers]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logging.error(f"Error deleting layer version: {e}")
+
+    def resolve_dependencies(self, resource_type):
+        DEPENDENCY_GRAPH = {
+            'vpc': ['ec2', 'rds', 'elasticache', 'elb'],
+            'eks_cluster': ['nodegroup', 'fargate_profile'],
+            'rds': ['db_subnet_group', 'option_group'],
+            'iam_role': ['lambda', 'ec2', 'eks'],
+            'kms_keys': []  # Add KMS keys with no dependencies
+        }
+        return DEPENDENCY_GRAPH.get(resource_type, [])
+
+    @lru_cache
+    def is_service_available(self, region, service_name):
+        try:
+            client = self.session.client('service-quotas', region_name=region)
+            client.list_services()
+            return True
+        except EndpointConnectionError:
+            return False
+
+    def regional_operation(self, func):
+        def wrapper(self, region):
+            if not self.is_service_available(region, func.__name__[7:]):
+                logging.info(f"Skipping {func.__name__} in {region}")
+                return
+            try:
+                return func(self, region)
+            except WaiterError as e:
+                logging.error(f"Timeout waiting for {func.__name__} in {region}: {e}")
+        return wrapper
+
+    def delete_tagged_resources(self, tag_key='Purge', tag_value='true'):
+        client = self.session.client('resourcegroupstaggingapi')
+        resources = client.get_resources(
+            TagFilters=[{'Key': tag_key, 'Values': [tag_value]}]
+        )['ResourceTagMappingList']
+        
+        for resource in resources:
+            arn = resource['ResourceARN']
+            service = arn.split(':')[2]
+            delete_method = getattr(self, f'delete_{service}_resource', None)
+            if delete_method:
+                delete_method(arn)
+
+    def delete_stacks(self):
+        client = self.session.client('cloudformation')
+        stacks = client.list_stacks()['StackSummaries']
+        for stack in stacks:
+            if stack['StackStatus'] not in ['DELETE_COMPLETE']:
+                client.delete_stack(StackName=stack['StackName'])
+
+    def pre_delete_checks(self, resource_type, resource_id):
+        if resource_type == 'rds':
+            client = boto3.client('rds')
+            instance = client.describe_db_instances(DBInstanceIdentifier=resource_id)
+            if instance['DeletionProtection']:
+                raise Exception("Deletion protection enabled")
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Super AWS Cleanup Script')
     parser.add_argument('--region', help='Optional region to clean. If not provided, all regions are processed.', default=None)
     parser.add_argument('-v', '--verbose', action='count', default=0,
                         help='Increase verbosity level (-v for INFO, -vv for DEBUG)')
+    parser.add_argument('--live-run', action='store_true', default=False,
+                        help='Perform actual deletion of resources. USE WITH EXTREME CAUTION!')
     return parser.parse_args()
 
 def main():
@@ -1109,7 +705,29 @@ def main():
     else:
         logging.getLogger().setLevel(logging.WARNING)
     cleaner = SuperAWSResourceCleaner()
-    cleaner.purge_aws(region=args.region)
+    
+    if args.live_run:
+        logging.warning("--- LIVE RUN MODE ENABLED --- Resources WILL be deleted. --- ")
+        # Add a small delay to allow user to cancel if run by mistake
+        try:
+            for i in range(5, 0, -1):
+                print(f"Starting deletion in {i} seconds... (Ctrl+C to cancel)", end='\r')
+                time.sleep(1)
+            print("                                                          ", end='\r') # Clear line
+        except KeyboardInterrupt:
+            logging.info("Live run cancelled by user.")
+            return
+    
+    cleaner.purge_aws(region=args.region, dry_run=not args.live_run)
 
 if __name__ == '__main__':
     main()
+
+def adaptive_concurrency():
+    current_limit = 10
+    while True:
+        try:
+            # Выполнение операций
+            current_limit = min(current_limit * 1.5, 100)
+        except ThrottlingException:
+            current_limit = max(current_limit * 0.7, 1)
