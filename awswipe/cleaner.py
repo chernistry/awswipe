@@ -503,15 +503,14 @@ class SuperAWSResourceCleaner:
             logging.error(f"[{region}] Error accessing KMS: {e}")
 
     def purge_aws(self):
-        region = self.config.region
-        if region:
-            regions = [region]
-            logging.info(f"Cleaning only region {region}")
-        else:
+        if "all" in self.config.regions:
             regions = self.get_all_regions()
             if not regions:
                 logging.error('No regions found. Exiting.')
                 return
+        else:
+            regions = self.config.regions
+            logging.info(f"Cleaning regions: {regions}")
 
         if self.config.dry_run:
             logging.info("Running in dry-run mode - no resources will be deleted")
@@ -539,13 +538,9 @@ class SuperAWSResourceCleaner:
                 executor.submit(self.delete_aws_backup_vaults_global),
             ]
 
-            if region:
-                futures.append(executor.submit(self.delete_apprunner_services, region))
-                futures.append(executor.submit(self.delete_amplify_apps, region))
-            else:
-                for r_item in regions: 
-                    futures.append(executor.submit(self.delete_apprunner_services, r_item))
-                    futures.append(executor.submit(self.delete_amplify_apps, r_item))
+            for r_item in regions: 
+                futures.append(executor.submit(self.delete_apprunner_services, r_item))
+                futures.append(executor.submit(self.delete_amplify_apps, r_item))
             
             for fut in as_completed(futures):
                 try:

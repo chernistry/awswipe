@@ -1,87 +1,93 @@
-# 🧹 AWSwipe - Super AWS Resource Cleaner
+# AWSwipe
 
-![Project Banner](./assets/awswipe-logo.png)
+![AWSwipe](./assets/awswipe-logo.png)
 
-**Effortlessly clean up AWS resources with AWSwipe – a powerful automation tool for AWS infrastructure cleanup.**
+Automated AWS resource cleanup tool. Deletes orphaned resources across all regions, reduces costs, maintains account hygiene.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)  
-[![Issues](https://img.shields.io/github/issues/chernistry/awswipe)](https://github.com/chernistry/awswipe/issues)  
-[![Version](https://img.shields.io/badge/Version-1.0.0-green.svg)](https://github.com/chernistry/awswipe/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
----
+## Why
 
-## 🚀 Overview
-AWSwipe is an advanced Python-based tool designed to **automate the cleanup of AWS resources** across multiple regions. It helps in:
+- Dev/test accounts accumulate unused resources
+- Orphaned EBS volumes, snapshots, and EIPs cost money
+- Manual cleanup is tedious and error-prone
+- AWS doesn't auto-delete your forgotten infrastructure
 
-✅ Deleting orphaned AWS resources
-✅ Managing AWS account hygiene efficiently
-✅ Avoiding unnecessary costs due to unused AWS services
-✅ Ensuring compliance with security best practices
+## Features
 
----
-
-## ⚙️ Features
 | Feature | Description |
-|---------|------------|
-| 🌎 Multi-Region Support | Cleans up AWS resources across all available regions |
-| 🔄 Automated Cleanup | Intelligent retry mechanism for failed deletions |
-| 🔍 Logging & Reporting | Detailed logging and a final cleanup report |
-| 🛠️ Customizable Execution | Choose specific regions or resource types to clean |
-| 🔐 Secure Operations | Uses IAM role permissions to safely clean AWS |
+|---------|-------------|
+| Multi-region | Cleans all AWS regions in parallel |
+| Safe by default | Dry-run mode, tag filtering, exclude patterns |
+| Comprehensive | EC2, EBS, S3, Lambda, VPC, IAM, RDS, EKS, and more |
+| Configurable | YAML config or CLI flags |
+| Observable | Structured JSON logging, detailed reports |
 
----
+## Installation
 
-## 🛠 Installation & Setup
-
-### 📥 Prerequisites
-- Python 3.8+
-- AWS CLI configured with credentials
-- Boto3 library installed
-
-### 📌 Installation Steps
-```sh
-# Clone the repository
+```bash
 git clone https://github.com/chernistry/awswipe.git
 cd awswipe
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 🏗️ Configuration
-Ensure AWS credentials are configured:
-```sh
-aws configure
-```
-Or use an IAM role with appropriate permissions.
+Requires Python 3.8+ and configured AWS credentials (`aws configure`).
 
----
+## Usage
 
-## 🚀 Usage
-Run the script to clean all AWS regions:
-```sh
+```bash
+# Dry-run (default) - see what would be deleted
 python awswipe.py
+
+# Interactive menu
+python awswipe.py --interactive
+
+# Delete everything in specific region
+python awswipe.py --region us-east-1 --live-run
+
+# Use config file
+python awswipe.py --config config.yaml
+
+# Verbose JSON logs
+python awswipe.py -vv --json-logs
 ```
 
-To clean a specific AWS region:
-```sh
-python awswipe.py --region us-east-1
+## Configuration
+
+Copy `config.example.yaml` to `config.yaml`:
+
+```yaml
+regions:
+  - us-east-1
+  - eu-west-1
+
+resource_types:
+  - ec2
+  - s3
+  - lambda
+
+tag_filters:
+  include:
+    Environment: [dev, test]
+  exclude:
+    DoNotDelete: ["true"]
+
+exclude_patterns:
+  - "prod-*"
+  - "critical-*"
+
+dry_run: true
 ```
 
-Enable verbose logging:
-```sh
-python awswipe.py -v
-```
+## Report Example
 
----
-
-## 📊 Cleanup Report Example
 ```
-=== AWS Super Cleanup Report ===
+=== AWS Cleanup Report ===
 
 Resource: S3 Buckets
   Deleted:
-    - my-unused-bucket
+    - dev-temp-bucket
+    - test-logs-2024
   Failed:
     None
 
@@ -92,34 +98,18 @@ Resource: EC2 Instances
     - i-09xyz987lmn654pq (Permission Denied)
 ```
 
----
+## Troubleshooting
 
-## 🛠 Troubleshooting
-| Issue | Resolution |
-|--------|------------|
-| `botocore.exceptions.NoCredentialsError` | Run `aws configure` to set credentials |
-| `Permission Denied` | Ensure the IAM role has sufficient delete permissions |
-| `ThrottlingException` | AWS rate limits apply, retry later |
+| Error | Solution |
+|-------|----------|
+| `NoCredentialsError` | Run `aws configure` |
+| `Permission Denied` | Check IAM permissions |
+| `ThrottlingException` | Retry later or reduce concurrency |
 
----
+## License
 
-## 🤝 Contributing
-Want to improve AWSwipe? Follow these steps:
-1. **Fork** the repository
-2. **Create** a feature branch: `git checkout -b feature-new-enhancement`
-3. **Commit** your changes: `git commit -m 'Add new feature'`
-4. **Push** to GitHub: `git push origin feature-new-enhancement`
-5. **Open a Pull Request**
+MIT
 
----
+## Author
 
-## 📜 License
-AWSwipe is licensed under the **MIT License**. 
-
----
-
-## 📢 Contact & Community
-Created by **Alexander (Sasha) Chernysh**  
-GitHub: [chernistry](https://github.com/chernistry)  
-Got questions? Open an [issue](https://github.com/chernistry/awswipe/issues) or start a discussion!
-
+Alexander Chernysh — [GitHub](https://github.com/chernistry)
