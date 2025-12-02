@@ -10,6 +10,12 @@ from awswipe.core.retry import retry_delete, SLEEP_LONG, SLEEP_SHORT
 from awswipe.core.logging import timed
 from awswipe.resources.s3 import S3Cleaner
 from awswipe.resources.iam import IamCleaner
+from awswipe.resources.ec2 import EC2Cleaner
+from awswipe.resources.ebs import EBSCleaner
+from awswipe.resources.lambda_ import LambdaCleaner
+from awswipe.resources.elb import ELBCleaner
+from awswipe.resources.autoscaling import ASGCleaner
+from awswipe.resources.vpc import VPCCleaner
 
 class SuperAWSResourceCleaner:
     def __init__(self, config: Config):
@@ -26,6 +32,12 @@ class SuperAWSResourceCleaner:
         # Initialize sub-cleaners
         self.s3_cleaner = S3Cleaner(self.session, self.config, self.report)
         self.iam_cleaner = IamCleaner(self.session, self.config, self.report)
+        self.ec2_cleaner = EC2Cleaner(self.session, self.config, self.report)
+        self.ebs_cleaner = EBSCleaner(self.session, self.config, self.report)
+        self.lambda_cleaner = LambdaCleaner(self.session, self.config, self.report)
+        self.elb_cleaner = ELBCleaner(self.session, self.config, self.report)
+        self.asg_cleaner = ASGCleaner(self.session, self.config, self.report)
+        self.vpc_cleaner = VPCCleaner(self.session, self.config, self.report)
 
     def _record_result(self, resource_type, resource_id, success, message=''):
         if self.config.dry_run:
@@ -86,6 +98,13 @@ class SuperAWSResourceCleaner:
             'sqs',
             'sns',
             'codebuild_projects',
+            # New resources
+            'asg',
+            'elb',
+            'lambda',
+            'ec2',
+            'ebs',
+            'vpc',
         ]
         
         for resource in reversed(cleanup_order):
@@ -102,7 +121,25 @@ class SuperAWSResourceCleaner:
     def delete_service_linked_roles_global(self):
         self.iam_cleaner.delete_service_linked_roles_global()
 
-    # --- Existing Methods (kept for now, to be refactored later) ---
+    def delete_ec2(self, region):
+        self.ec2_cleaner.cleanup(region)
+
+    def delete_ebs(self, region):
+        self.ebs_cleaner.cleanup(region)
+
+    def delete_lambda(self, region):
+        self.lambda_cleaner.cleanup(region)
+
+    def delete_elb(self, region):
+        self.elb_cleaner.cleanup(region)
+
+    def delete_asg(self, region):
+        self.asg_cleaner.cleanup(region)
+
+    def delete_vpc(self, region):
+        self.vpc_cleaner.cleanup(region)
+
+    # --- Existing Methods (kept for now) ---
     
     def delete_eks_clusters_global(self):
         regions = [self.session.region_name] if self.session.region_name else self.get_all_regions()
@@ -470,11 +507,13 @@ class SuperAWSResourceCleaner:
 
     def resolve_dependencies(self, resource_type):
         DEPENDENCY_GRAPH = {
-            'vpc': ['ec2', 'rds', 'elasticache', 'elb'],
+            'vpc': ['ec2', 'rds', 'elasticache', 'elb', 'lambda', 'asg', 'ebs'],
             'eks_cluster': ['nodegroup', 'fargate_profile'],
             'rds': ['db_subnet_group', 'option_group'],
             'iam_role': ['lambda', 'ec2', 'eks'],
-            'kms_keys': []
+            'kms_keys': [],
+            'asg': ['ec2'],
+            'ec2': ['ebs', 'elb'], # EC2 instances might be attached to ELBs or have EBS volumes
         }
         return DEPENDENCY_GRAPH.get(resource_type, [])
 
