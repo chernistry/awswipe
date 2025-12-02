@@ -5,6 +5,13 @@ from awswipe.resources.base import ResourceCleaner
 from awswipe.core.retry import retry_delete
 
 class LambdaCleaner(ResourceCleaner):
+    @property
+    def prerequisites(self):
+        # Lambda might use VPC resources, but usually doesn't prevent other things from deleting
+        # except maybe ENIs in VPC. So it should run before VPC.
+        # It might depend on IAM roles, but we delete roles globally later.
+        return []
+
     def cleanup(self, region=None):
         self.delete_functions(region)
         self.delete_layers(region)

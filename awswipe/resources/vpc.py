@@ -5,6 +5,11 @@ from awswipe.core.retry import retry_delete, SLEEP_SHORT
 import time
 
 class VPCCleaner(ResourceCleaner):
+    @property
+    def prerequisites(self):
+        # VPC should be cleaned last, after all resources that might use ENIs
+        return ['ec2', 'ebs', 'lambda', 'elb', 'asg', 'rds', 'elasticache', 'efs']
+
     def cleanup(self, region=None):
         self.delete_nat_gateways(region)
         self.delete_internet_gateways(region)

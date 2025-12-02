@@ -4,6 +4,10 @@ from awswipe.resources.base import ResourceCleaner
 from awswipe.core.retry import retry_delete
 
 class EBSCleaner(ResourceCleaner):
+    @property
+    def prerequisites(self):
+        return ['ec2']
+
     def cleanup(self, region=None):
         self.delete_volumes(region)
         self.delete_snapshots(region)

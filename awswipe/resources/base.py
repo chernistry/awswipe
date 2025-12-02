@@ -37,6 +37,10 @@ class ResourceCleaner(ABC):
             msg = f"{resource_id} ({message})" if message else resource_id
             self.report[resource_type]['failed'].append(msg)
 
+    @property
+    def prerequisites(self) -> List[str]:
+        return []
+
     @abstractmethod
     def cleanup(self, region: Optional[str] = None):
         pass

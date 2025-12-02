@@ -4,6 +4,10 @@ from awswipe.resources.base import ResourceCleaner
 from awswipe.core.retry import retry_delete
 
 class EC2Cleaner(ResourceCleaner):
+    @property
+    def prerequisites(self):
+        return []
+
     def cleanup(self, region=None):
         self.terminate_instances(region)
 

@@ -5,6 +5,10 @@ from awswipe.core.retry import retry_delete, SLEEP_SHORT
 import time
 
 class ELBCleaner(ResourceCleaner):
+    @property
+    def prerequisites(self):
+        return ['ec2']
+
     def cleanup(self, region=None):
         self.delete_load_balancers_v2(region)
         self.delete_target_groups(region)

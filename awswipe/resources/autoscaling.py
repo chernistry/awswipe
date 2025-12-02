@@ -4,6 +4,10 @@ from awswipe.resources.base import ResourceCleaner
 from awswipe.core.retry import retry_delete
 
 class ASGCleaner(ResourceCleaner):
+    @property
+    def prerequisites(self):
+        return ['ec2']
+
     def cleanup(self, region=None):
         self.delete_asgs(region)
         self.delete_launch_configurations(region)

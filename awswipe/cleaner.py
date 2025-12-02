@@ -80,36 +80,90 @@ class SuperAWSResourceCleaner:
 
     @timed
     def cleanup_region(self, region):
-        visited = set()
-        def dfs(resource):
-            for dependency in self.resolve_dependencies(resource):
-                if dependency not in visited:
-                    dfs(dependency)
-            if hasattr(self, f'delete_{resource}'):
-                getattr(self, f'delete_{resource}')(region)
-            visited.add(resource)
+        from awswipe.core.dependency_graph import DependencyGraph
         
-        cleanup_order = [
-            'kms_keys',
-            'efs',
-            'elasticache',
-            'rds',
-            'dynamodb',
-            'sqs',
-            'sns',
-            'codebuild_projects',
-            # New resources
-            'asg',
-            'elb',
-            'lambda',
-            'ec2',
-            'ebs',
-            'vpc',
+        graph = DependencyGraph()
+        
+        # Register cleaners and their prerequisites
+        # We map 'resource_type' string to the cleaner instance method
+        cleaners_map = {
+            's3': self.s3_cleaner, # Global, but maybe regional buckets?
+            'iam': self.iam_cleaner, # Global
+            'ec2': self.ec2_cleaner,
+            'ebs': self.ebs_cleaner,
+            'lambda': self.lambda_cleaner,
+            'elb': self.elb_cleaner,
+            'asg': self.asg_cleaner,
+            'vpc': self.vpc_cleaner,
+            # Add placeholders for others if they don't have cleaners yet but are dependencies
+            'rds': None,
+            'elasticache': None,
+            'efs': None,
+        }
+        
+        # Add nodes to graph
+        for name, cleaner in cleaners_map.items():
+            if cleaner:
+                graph.add_node(name, cleaner.prerequisites)
+            else:
+                # For placeholders, we assume no prerequisites for now, or we just don't add them
+                # If they are prerequisites of others, they will be added by add_node logic
+                pass
+
+        execution_order = graph.get_execution_order()
+        logging.info(f"[{region}] Cleanup execution order: {execution_order}")
+        
+        for resource in execution_order:
+            if resource in cleaners_map and cleaners_map[resource]:
+                logging.info(f"[{region}] Cleaning {resource}")
+                cleaners_map[resource].cleanup(region)
+            elif hasattr(self, f'delete_{resource}'):
+                 # Fallback for legacy methods or placeholders that map to legacy methods
+                 # We need to ensure legacy methods are available or mapped
+                 logging.info(f"[{region}] Cleaning {resource} (legacy)")
+                 getattr(self, f'delete_{resource}')(region)
+            else:
+                 logging.debug(f"[{region}] No cleaner for {resource}, skipping")
+
+        # Legacy cleanup for things not in the graph yet
+        # We can keep the old list for things NOT in execution_order
+        # But for now, let's trust the graph for the main resources we migrated.
+        
+        # What about resources NOT in the graph but in the old list?
+        # 'kms_keys', 'efs', 'elasticache', 'rds', 'dynamodb', 'sqs', 'sns', 'codebuild_projects'
+        # We should add them to the graph or run them separately.
+        # Ideally, we migrate them to cleaners or add them to the graph with legacy mapping.
+        
+        legacy_resources = [
+            'kms_keys', 'efs', 'elasticache', 'rds', 'dynamodb', 'sqs', 'sns', 'codebuild_projects'
         ]
+        # These usually don't have strong dependencies on the new stuff, except maybe VPC?
+        # RDS/ElastiCache/EFS are in VPC, so they should run BEFORE VPC.
+        # VPCCleaner depends on them.
+        # So we should add them to the graph.
         
-        for resource in reversed(cleanup_order):
-            if resource not in visited:
-                dfs(resource)
+        # Let's add them to the graph with empty prerequisites for now (or correct ones if known)
+        # And ensure we have a way to call them.
+        
+        # Update cleaners_map with legacy methods mapping if possible, or just handle in loop
+        # But 'delete_rds' expects 'region' arg.
+        
+        # Let's add them to the graph.
+        for res in legacy_resources:
+            graph.add_node(res, []) # Assume no prereqs for now
+            
+        # Re-calculate order
+        execution_order = graph.get_execution_order()
+        logging.info(f"[{region}] Final execution order: {execution_order}")
+
+        for resource in execution_order:
+            if resource in cleaners_map and cleaners_map[resource]:
+                cleaners_map[resource].cleanup(region)
+            elif hasattr(self, f'delete_{resource}'):
+                getattr(self, f'delete_{resource}')(region)
+            elif hasattr(self, f'delete_{resource}_global'):
+                 # Some might be global? No, cleanup_region is regional.
+                 pass
 
     # --- Delegated Methods ---
     def delete_s3_buckets_global(self):
