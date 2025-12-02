@@ -1,0 +1,45 @@
+# AWSwipe Configuration Example
+# Copy to config.yaml and customize
+
+# Regions to clean (list or "all")
+regions:
+  - us-east-1
+  - eu-west-1
+  # - all  # uncomment to clean all regions
+
+# Resource types to clean (list or "all")
+resource_types:
+  - ec2
+  - s3
+  - lambda
+  - rds
+  # - all  # uncomment to clean all resource types
+
+# Tag-based filtering
+tag_filters:
+  # Only delete resources matching these tags
+  include:
+    Environment:
+      - dev
+      - test
+      - sandbox
+  # Never delete resources with these tags
+  exclude:
+    DoNotDelete:
+      - "true"
+    Environment:
+      - production
+      - prod
+
+# Name patterns to exclude (glob syntax)
+exclude_patterns:
+  - "prod-*"
+  - "critical-*"
+  - "*-production"
+
+# Safety settings
+dry_run: true  # Set to false for actual deletion
+
+# Logging
+json_logs: false  # Set to true for JSON output
+verbosity: 1  # 0=WARNING, 1=INFO, 2=DEBUG
