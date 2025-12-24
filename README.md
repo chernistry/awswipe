@@ -50,13 +50,15 @@ pip install -r requirements.txt
 
 Requires Python 3.8+ and configured AWS credentials (`aws configure`).
 
+Dependencies: boto3, PyYAML, textual (for interactive TUI).
+
 ## Usage
 
 ```bash
 # Dry-run (default) - see what would be deleted
 python awswipe.py
 
-# Interactive menu
+# Interactive TUI mode
 python awswipe.py --interactive
 
 # Delete everything in specific region
@@ -68,6 +70,18 @@ python awswipe.py --config config.yaml
 # Verbose JSON logs
 python awswipe.py -vv --json-logs
 ```
+
+### Interactive Mode
+
+The `--interactive` flag launches a TUI (Terminal User Interface) with options:
+- Preview (dry-run)
+- Nuke single region
+- NUKE ALL
+- Clean compute / storage / networking
+- Clean dev/test tagged resources only
+- Custom resource selection
+
+Requires confirmation by typing "CONFIRM" for destructive operations.
 
 ## Configuration
 
@@ -99,7 +113,7 @@ dry_run: true
 ## Report Example
 
 ```
-=== AWS Cleanup Report ===
+=== AWS Super Cleanup Report ===
 
 Resource: S3 Buckets
   Deleted:
@@ -113,6 +127,12 @@ Resource: EC2 Instances
     - i-0abc123def456gh78
   Failed:
     - i-09xyz987lmn654pq (Permission Denied)
+
+Resource: SageMaker Endpoints
+  Deleted:
+    - openjourney-1764854460 (eu-central-1)
+  Failed:
+    None
 ```
 
 ## Troubleshooting
