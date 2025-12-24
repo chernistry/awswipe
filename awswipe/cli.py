@@ -17,11 +17,19 @@ def parse_args():
                         help='Output logs in JSON format')
     parser.add_argument('--live-run', action='store_true',
                         help='Actually delete resources (default: dry-run)')
+    parser.add_argument('--interactive', '-i', action='store_true',
+                        help='Interactive menu mode')
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    
+    # Interactive mode
+    if args.interactive:
+        from awswipe.interactive import run_interactive
+        run_interactive()
+        return
     
     # Load config from file or defaults
     config = load_config(args.config)

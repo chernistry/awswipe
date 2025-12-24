@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 import boto3
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
+from botocore.exceptions import EndpointConnectionError
 from awswipe.core.config import Config
 
 class ResourceCleaner(ABC):
@@ -36,6 +38,17 @@ class ResourceCleaner(ABC):
         else:
             msg = f"{resource_id} ({message})" if message else resource_id
             self.report[resource_type]['failed'].append(msg)
+
+    @lru_cache
+    def is_service_available(self, region, service_name):
+        try:
+            client = self.session.client(service_name, region_name=region)
+            # Try a lightweight call to check availability
+            return True
+        except EndpointConnectionError:
+            return False
+        except Exception:
+            return True  # Assume available if we can't determine
 
     @property
     def prerequisites(self) -> List[str]:

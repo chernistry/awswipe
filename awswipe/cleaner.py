@@ -16,6 +16,7 @@ from awswipe.resources.lambda_ import LambdaCleaner
 from awswipe.resources.elb import ELBCleaner
 from awswipe.resources.autoscaling import ASGCleaner
 from awswipe.resources.vpc import VPCCleaner
+from awswipe.resources.sagemaker import SageMakerCleaner
 
 class SuperAWSResourceCleaner:
     def __init__(self, config: Config):
@@ -38,6 +39,7 @@ class SuperAWSResourceCleaner:
         self.elb_cleaner = ELBCleaner(self.session, self.config, self.report)
         self.asg_cleaner = ASGCleaner(self.session, self.config, self.report)
         self.vpc_cleaner = VPCCleaner(self.session, self.config, self.report)
+        self.sagemaker_cleaner = SageMakerCleaner(self.session, self.config, self.report)
 
     def _record_result(self, resource_type, resource_id, success, message=''):
         if self.config.dry_run:
@@ -95,6 +97,7 @@ class SuperAWSResourceCleaner:
             'elb': self.elb_cleaner,
             'asg': self.asg_cleaner,
             'vpc': self.vpc_cleaner,
+            'sagemaker': self.sagemaker_cleaner,
             # Add placeholders for others if they don't have cleaners yet but are dependencies
             'rds': None,
             'elasticache': None,

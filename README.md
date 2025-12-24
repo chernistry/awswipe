@@ -19,9 +19,26 @@ Automated AWS resource cleanup tool. Deletes orphaned resources across all regio
 |---------|-------------|
 | Multi-region | Cleans all AWS regions in parallel |
 | Safe by default | Dry-run mode, tag filtering, exclude patterns |
-| Comprehensive | EC2, EBS, S3, Lambda, VPC, IAM, RDS, EKS, and more |
+| Comprehensive | EC2, EBS, S3, Lambda, VPC, IAM, RDS, EKS, SageMaker, and more |
 | Configurable | YAML config or CLI flags |
 | Observable | Structured JSON logging, detailed reports |
+
+## Supported Resources
+
+- EC2 (instances, AMIs, snapshots)
+- EBS (volumes)
+- S3 (buckets and objects)
+- Lambda (functions)
+- VPC (subnets, security groups, NAT gateways, etc.)
+- IAM (roles, policies, instance profiles)
+- ELB/ALB/NLB
+- Auto Scaling Groups
+- SageMaker (endpoints, endpoint configs, models, notebooks, domains)
+- EKS (clusters, nodegroups)
+- RDS, ElastiCache, DynamoDB, SQS, SNS
+- Route53, CloudFront, Global Accelerator
+- CodeBuild, AppRunner, Amplify
+- KMS keys, AWS Backup vaults
 
 ## Installation
 

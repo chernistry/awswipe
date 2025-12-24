@@ -1,3 +1,4 @@
 boto3
 botocore
 PyYAML>=6.0
+textual>=0.85.0
